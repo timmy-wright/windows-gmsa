@@ -337,6 +337,19 @@ func TestMutateCreateRequest(t *testing.T) {
 					}
 
 					partialPath = fmt.Sprintf("/initContainers/%d", containerIndex)
+				case ephemeralContainerKind:
+					containerIndex := -1
+					for i, container := range pod.Spec.EphemeralContainers {
+						if container.Name == name {
+							containerIndex = i
+							break
+						}
+					}
+					if containerIndex == -1 {
+						t.Fatalf("Did not find any ephemeral container named %q", name)
+					}
+
+					partialPath = fmt.Sprintf("/ephemeralContainers/%d", containerIndex)
 				}
 
 				return fmt.Sprintf("/spec%s/securityContext/windowsOptions/gmsaCredentialSpec", partialPath)
@@ -612,7 +625,7 @@ func runWebhookValidateOrMutateTests(t *testing.T, winOptionsFactory containerWi
 			testNameSuffix = fmt.Sprintf(" and %d extra containers", extraContainersCount)
 		}
 
-		for _, resourceKind := range []gmsaResourceKind{podKind, containerKind, initContainerKind} {
+		for _, resourceKind := range []gmsaResourceKind{podKind, containerKind, initContainerKind, ephemeralContainerKind} {
 			for testName, testFunc := range tests {
 				podWindowsOptions := &corev1.WindowsSecurityContextOptions{}
 
@@ -673,6 +686,28 @@ func runWebhookValidateOrMutateTests(t *testing.T, winOptionsFactory containerWi
 					}
 
 					resourceName = dummyContainerName
+				case ephemeralContainerKind:
+					// the dummy container under test is an ephemeral container here, so it must not
+					// also be present amongst the (regular) extra containers.
+					delete(containerNamesAndWindowsOptions, dummyContainerName)
+					ephemeralContainerNamesAndWindowsOptions := map[string]*corev1.WindowsSecurityContextOptions{dummyContainerName: {}}
+					pod = buildPodWithEphemeralContainers(dummyServiceAccoutName, nil, podWindowsOptions, containerNamesAndWindowsOptions, nil, ephemeralContainerNamesAndWindowsOptions)
+
+					optionsSelector = func(pod *corev1.Pod) *corev1.WindowsSecurityContextOptions {
+						if pod != nil {
+							for _, container := range pod.Spec.EphemeralContainers {
+								if container.Name == dummyContainerName {
+									if container.SecurityContext != nil {
+										return container.SecurityContext.WindowsOptions
+									}
+									return nil
+								}
+							}
+						}
+						return nil
+					}
+
+					resourceName = dummyContainerName
 				default:
 					t.Fatalf("Unknown resource kind: %q", resourceKind)
 				}
@@ -692,11 +727,12 @@ func extraContainerName(i int) string {
 // numExtraRegularContainers returns the number of "extra" (i.e. not under test) regular
 // containers set on pod.Spec.Containers. runWebhookValidateOrMutateTests always mixes the
 // container under test into pod.Spec.Containers for podKind/containerKind, but keeps
-// pod.Spec.Containers to only the extra containers for initContainerKind (the container under
-// test lives in pod.Spec.InitContainers instead).
+// pod.Spec.Containers to only the extra containers for initContainerKind and
+// ephemeralContainerKind (the container under test lives in pod.Spec.InitContainers or
+// pod.Spec.EphemeralContainers instead).
 func numExtraRegularContainers(pod *corev1.Pod, resourceKind gmsaResourceKind) int {
 	count := len(pod.Spec.Containers)
-	if resourceKind != initContainerKind {
+	if resourceKind != initContainerKind && resourceKind != ephemeralContainerKind {
 		count--
 	}
 	return count
