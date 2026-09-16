@@ -34,9 +34,10 @@ const (
 	validate webhookOperation = "VALIDATE"
 	mutate   webhookOperation = "MUTATE"
 
-	podKind           gmsaResourceKind = "pod"
-	containerKind     gmsaResourceKind = "container"
-	initContainerKind gmsaResourceKind = "initContainer"
+	podKind                gmsaResourceKind = "pod"
+	containerKind          gmsaResourceKind = "container"
+	initContainerKind      gmsaResourceKind = "initContainer"
+	ephemeralContainerKind gmsaResourceKind = "ephemeralContainer"
 )
 
 type webhook struct {
@@ -276,6 +277,22 @@ func (webhook *webhook) validateOrMutate(ctx context.Context, request *admission
 		}
 
 	case admissionV1.Update:
+		// ephemeral containers can only be appended to a pod (never modified in place) via this
+		// dedicated subresource - `pod` here already reflects the post-append state, and there is
+		// no "old" resource to speak of, so it needs its own handling rather than going through
+		// `validateUpdateRequest`, which assumes no new resources ever show up on update.
+		if request.SubResource == "ephemeralcontainers" {
+			switch operation {
+			case validate:
+				return webhook.validateEphemeralContainersUpdateRequest(ctx, pod, request.Namespace)
+			case mutate:
+				return webhook.mutateEphemeralContainersUpdateRequest(ctx, pod)
+			default:
+				// shouldn't happen, but needed so that all paths in the function have a return value
+				panic(fmt.Errorf("unexpected webhook operation: %v", operation))
+			}
+		}
+
 		if operation == validate {
 			oldPod, err := unmarshallPod(request.OldObject)
 			if err != nil {
@@ -284,7 +301,7 @@ func (webhook *webhook) validateOrMutate(ctx context.Context, request *admission
 			return validateUpdateRequest(pod, oldPod)
 		}
 
-		// we only do validation on updates, no mutation
+		// we only do validation on regular pod updates, no mutation
 		return &admissionV1.AdmissionResponse{Allowed: true}, nil
 	default:
 		return nil, &podAdmissionError{error: fmt.Errorf("unpexpected operation %s", request.Operation), pod: pod, code: http.StatusBadRequest}
@@ -305,7 +322,23 @@ func unmarshallPod(object runtime.RawExtension) (*corev1.Pod, *podAdmissionError
 // match the corresponding GMSA names, and that the pod's service account
 // is authorized to `use` the requested GMSA's.
 func (webhook *webhook) validateCreateRequest(ctx context.Context, pod *corev1.Pod, namespace string) (*admissionV1.AdmissionResponse, *podAdmissionError) {
-	if err := iterateOverWindowsSecurityOptions(pod, func(windowsOptions *corev1.WindowsSecurityContextOptions, resourceKind gmsaResourceKind, resourceName string, _ int) *podAdmissionError {
+	return webhook.validateWindowsSecurityOptions(ctx, pod, namespace, iterateOverWindowsSecurityOptions)
+}
+
+// validateEphemeralContainersUpdateRequest ensures that the GMSA contents set on any of the pod's
+// ephemeral containers match the corresponding GMSA names, and that the pod's service account is
+// authorized to `use` the requested GMSA's. Ephemeral containers can only be appended to a pod (never
+// modified or removed) via the `ephemeralcontainers` subresource, so the same checks used at pod
+// creation time apply here, run only over `.Spec.EphemeralContainers`.
+func (webhook *webhook) validateEphemeralContainersUpdateRequest(ctx context.Context, pod *corev1.Pod, namespace string) (*admissionV1.AdmissionResponse, *podAdmissionError) {
+	return webhook.validateWindowsSecurityOptions(ctx, pod, namespace, iterateOverEphemeralContainerWindowsSecurityOptions)
+}
+
+// validateWindowsSecurityOptions ensures that the GMSA contents set in the resources reachable via
+// `iterate` match the corresponding GMSA names, and that the pod's service account is authorized to
+// `use` the requested GMSA's.
+func (webhook *webhook) validateWindowsSecurityOptions(ctx context.Context, pod *corev1.Pod, namespace string, iterate func(pod *corev1.Pod, f func(windowsOptions *corev1.WindowsSecurityContextOptions, resourceKind gmsaResourceKind, resourceName string, containerIndex int) *podAdmissionError) *podAdmissionError) (*admissionV1.AdmissionResponse, *podAdmissionError) {
+	if err := iterate(pod, func(windowsOptions *corev1.WindowsSecurityContextOptions, resourceKind gmsaResourceKind, resourceName string, _ int) *podAdmissionError {
 		if credSpecName := windowsOptions.GMSACredentialSpecName; credSpecName != nil {
 			// let's check that the associated service account can read the relevant cred spec CRD
 			if authorized, reason := webhook.client.isAuthorizedToUseCredSpec(ctx, pod.Spec.ServiceAccountName, namespace, *credSpecName); !authorized {
@@ -368,41 +401,8 @@ func compareCredSpecContents(fromResource, fromCRD string) (bool, error) {
 
 // mutateCreateRequest inlines the requested GMSA's into the pod's and containers' `WindowsSecurityOptions` structs.
 func (webhook *webhook) mutateCreateRequest(ctx context.Context, pod *corev1.Pod) (*admissionV1.AdmissionResponse, *podAdmissionError) {
-	var patches []map[string]string
-	hasGMSA := false
-
-	if err := iterateOverWindowsSecurityOptions(pod, func(windowsOptions *corev1.WindowsSecurityContextOptions, resourceKind gmsaResourceKind, resourceName string, containerIndex int) *podAdmissionError {
-		if credSpecName := windowsOptions.GMSACredentialSpecName; credSpecName != nil {
-			hasGMSA = true
-			// if the user has pre-set the GMSA's contents, we won't override it - it'll be down
-			// to the validation endpoint to make sure the contents actually are what they should
-			if credSpecContents := windowsOptions.GMSACredentialSpec; credSpecContents == nil {
-				contents, code, retrieveErr := webhook.client.retrieveCredSpecContents(ctx, *credSpecName)
-				if retrieveErr != nil {
-					return &podAdmissionError{error: retrieveErr, pod: pod, code: code}
-				}
-
-				partialPath := ""
-				switch resourceKind {
-				case containerKind:
-					partialPath = fmt.Sprintf("/containers/%d", containerIndex)
-				case initContainerKind:
-					partialPath = fmt.Sprintf("/initContainers/%d", containerIndex)
-				}
-
-				// worth noting that this JSON patch is guaranteed to work since we know at this point
-				// that the resource comprises a `windowsOptions` object, and and that it doesn't have a
-				// "gmsaCredentialSpec" field
-				patches = append(patches, map[string]string{
-					"op":    "add",
-					"path":  fmt.Sprintf("/spec%s/securityContext/windowsOptions/gmsaCredentialSpec", partialPath),
-					"value": contents,
-				})
-			}
-		}
-
-		return nil
-	}); err != nil {
+	patches, hasGMSA, err := webhook.computeGMSAPatches(ctx, pod, iterateOverWindowsSecurityOptions)
+	if err != nil {
 		return nil, err
 	}
 
@@ -422,6 +422,72 @@ func (webhook *webhook) mutateCreateRequest(ctx context.Context, pod *corev1.Pod
 		}
 	}
 
+	return buildPatchResponse(pod, patches)
+}
+
+// mutateEphemeralContainersUpdateRequest inlines the requested GMSA's into any of the pod's ephemeral
+// containers' `WindowsSecurityOptions` structs. Ephemeral containers can only be appended to a pod
+// (never modified or removed) via the `ephemeralcontainers` subresource, so it is safe to run this
+// over the whole `.Spec.EphemeralContainers` list on every such request: any container that was
+// already mutated by a previous request already has its GMSA contents set, and is left untouched.
+func (webhook *webhook) mutateEphemeralContainersUpdateRequest(ctx context.Context, pod *corev1.Pod) (*admissionV1.AdmissionResponse, *podAdmissionError) {
+	patches, _, err := webhook.computeGMSAPatches(ctx, pod, iterateOverEphemeralContainerWindowsSecurityOptions)
+	if err != nil {
+		return nil, err
+	}
+
+	return buildPatchResponse(pod, patches)
+}
+
+// computeGMSAPatches computes the JSON patches needed to inline the requested GMSA's contents into
+// the `WindowsSecurityOptions` structs reachable via `iterate`, along with whether any GMSA
+// credential spec name was found at all.
+func (webhook *webhook) computeGMSAPatches(ctx context.Context, pod *corev1.Pod, iterate func(pod *corev1.Pod, f func(windowsOptions *corev1.WindowsSecurityContextOptions, resourceKind gmsaResourceKind, resourceName string, containerIndex int) *podAdmissionError) *podAdmissionError) ([]map[string]string, bool, *podAdmissionError) {
+	var patches []map[string]string
+	hasGMSA := false
+
+	if err := iterate(pod, func(windowsOptions *corev1.WindowsSecurityContextOptions, resourceKind gmsaResourceKind, resourceName string, containerIndex int) *podAdmissionError {
+		if credSpecName := windowsOptions.GMSACredentialSpecName; credSpecName != nil {
+			hasGMSA = true
+			// if the user has pre-set the GMSA's contents, we won't override it - it'll be down
+			// to the validation endpoint to make sure the contents actually are what they should
+			if credSpecContents := windowsOptions.GMSACredentialSpec; credSpecContents == nil {
+				contents, code, retrieveErr := webhook.client.retrieveCredSpecContents(ctx, *credSpecName)
+				if retrieveErr != nil {
+					return &podAdmissionError{error: retrieveErr, pod: pod, code: code}
+				}
+
+				partialPath := ""
+				switch resourceKind {
+				case containerKind:
+					partialPath = fmt.Sprintf("/containers/%d", containerIndex)
+				case initContainerKind:
+					partialPath = fmt.Sprintf("/initContainers/%d", containerIndex)
+				case ephemeralContainerKind:
+					partialPath = fmt.Sprintf("/ephemeralContainers/%d", containerIndex)
+				}
+
+				// worth noting that this JSON patch is guaranteed to work since we know at this point
+				// that the resource comprises a `windowsOptions` object, and and that it doesn't have a
+				// "gmsaCredentialSpec" field
+				patches = append(patches, map[string]string{
+					"op":    "add",
+					"path":  fmt.Sprintf("/spec%s/securityContext/windowsOptions/gmsaCredentialSpec", partialPath),
+					"value": contents,
+				})
+			}
+		}
+
+		return nil
+	}); err != nil {
+		return nil, false, err
+	}
+
+	return patches, hasGMSA, nil
+}
+
+// buildPatchResponse wraps the given JSON patches into an `AdmissionResponse` allowing the request.
+func buildPatchResponse(pod *corev1.Pod, patches []map[string]string) (*admissionV1.AdmissionResponse, *podAdmissionError) {
 	admissionResponse := &admissionV1.AdmissionResponse{Allowed: true}
 	if len(patches) != 0 {
 		patchesBytes, err := json.Marshal(patches)
@@ -499,11 +565,13 @@ func equalStringPointers(s1, s2 *string) bool {
 }
 
 // iterateOverWindowsSecurityOptions calls `f` on the pod's `.Spec.SecurityContext.WindowsOptions` field,
-// as well as over each of its containers' and init containers' `.SecurityContext.WindowsOptions` field.
+// as well as over each of its containers', init containers', and ephemeral containers'
+// `.SecurityContext.WindowsOptions` field.
 // `f` can assume it only gets called with non-nil `WindowsSecurityOptions` pointers; the other
 // arguments give information on the resource owning that pointer - in particular, if that
-// resource is a container or an init container, `containerIndex` is the index of the container in the
-// spec's relevant list (`.Spec.Containers` or `.Spec.InitContainers`, respectively; -1 for pods).
+// resource is a container, an init container, or an ephemeral container, `containerIndex` is the
+// index of the container in the spec's relevant list (`.Spec.Containers`, `.Spec.InitContainers`,
+// or `.Spec.EphemeralContainers`, respectively; -1 for pods).
 // If `f` returns an error, that breaks the loop, and the error is bubbled up.
 func iterateOverWindowsSecurityOptions(pod *corev1.Pod, f func(windowsOptions *corev1.WindowsSecurityContextOptions, resourceKind gmsaResourceKind, resourceName string, containerIndex int) *podAdmissionError) *podAdmissionError {
 	if pod.Spec.SecurityContext != nil && pod.Spec.SecurityContext.WindowsOptions != nil {
@@ -523,6 +591,24 @@ func iterateOverWindowsSecurityOptions(pod *corev1.Pod, f func(windowsOptions *c
 	for i, container := range pod.Spec.InitContainers {
 		if container.SecurityContext != nil && container.SecurityContext.WindowsOptions != nil {
 			if err := f(container.SecurityContext.WindowsOptions, initContainerKind, container.Name, i); err != nil {
+				return err
+			}
+		}
+	}
+
+	return iterateOverEphemeralContainerWindowsSecurityOptions(pod, f)
+}
+
+// iterateOverEphemeralContainerWindowsSecurityOptions calls `f` on each of the pod's ephemeral
+// containers' `.SecurityContext.WindowsOptions` field (see `iterateOverWindowsSecurityOptions` for
+// details on `f`'s contract). It is also used standalone (rather than through
+// `iterateOverWindowsSecurityOptions`) to validate/mutate `ephemeralcontainers` subresource update
+// requests, since ephemeral containers are the only resource that can be appended to a pod after
+// its creation.
+func iterateOverEphemeralContainerWindowsSecurityOptions(pod *corev1.Pod, f func(windowsOptions *corev1.WindowsSecurityContextOptions, resourceKind gmsaResourceKind, resourceName string, containerIndex int) *podAdmissionError) *podAdmissionError {
+	for i, container := range pod.Spec.EphemeralContainers {
+		if container.SecurityContext != nil && container.SecurityContext.WindowsOptions != nil {
+			if err := f(container.SecurityContext.WindowsOptions, ephemeralContainerKind, container.Name, i); err != nil {
 				return err
 			}
 		}
