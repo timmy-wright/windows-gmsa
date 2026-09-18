@@ -561,7 +561,7 @@ func TestValidateEphemeralContainersUpdateRequest(t *testing.T) {
 			map[string]*corev1.WindowsSecurityContextOptions{dummyContainerName: matchingOptions},
 		)
 
-		response, err := webhook.validateEphemeralContainersUpdateRequest(context.Background(), pod, dummyNamespace)
+		response, err := webhook.validateEphemeralContainersUpdateRequest(context.Background(), pod, pod.Spec.EphemeralContainers, dummyNamespace)
 		assert.Nil(t, err)
 
 		require.NotNil(t, response)
@@ -578,7 +578,7 @@ func TestValidateEphemeralContainersUpdateRequest(t *testing.T) {
 			map[string]*corev1.WindowsSecurityContextOptions{dummyContainerName: ephemeralOptions},
 		)
 
-		response, err := webhook.validateEphemeralContainersUpdateRequest(context.Background(), pod, dummyNamespace)
+		response, err := webhook.validateEphemeralContainersUpdateRequest(context.Background(), pod, pod.Spec.EphemeralContainers, dummyNamespace)
 		assert.Nil(t, response)
 
 		assertPodAdmissionErrorContains(t, err, pod, http.StatusUnprocessableEntity,
@@ -602,7 +602,7 @@ func TestValidateEphemeralContainersUpdateRequest(t *testing.T) {
 			map[string]*corev1.WindowsSecurityContextOptions{dummyContainerName: ephemeralOptions},
 		)
 
-		response, err := webhook.validateEphemeralContainersUpdateRequest(context.Background(), pod, dummyNamespace)
+		response, err := webhook.validateEphemeralContainersUpdateRequest(context.Background(), pod, pod.Spec.EphemeralContainers, dummyNamespace)
 		assert.Nil(t, response)
 
 		assertPodAdmissionErrorContains(t, err, pod, http.StatusForbidden,
@@ -639,7 +639,7 @@ func TestMutateEphemeralContainersUpdateRequest(t *testing.T) {
 			map[string]*corev1.WindowsSecurityContextOptions{dummyContainerName: ephemeralOptions},
 		)
 
-		response, err := webhook.mutateEphemeralContainersUpdateRequest(context.Background(), pod)
+		response, err := webhook.mutateEphemeralContainersUpdateRequest(context.Background(), pod, pod.Spec.EphemeralContainers, 0)
 		assert.Nil(t, err)
 
 		require.NotNil(t, response)
@@ -657,7 +657,7 @@ func TestMutateEphemeralContainersUpdateRequest(t *testing.T) {
 
 		pod := buildPodWithEphemeralContainers(dummyServiceAccoutName, nil, nil, nil, nil, nil)
 
-		response, err := webhook.mutateEphemeralContainersUpdateRequest(context.Background(), pod)
+		response, err := webhook.mutateEphemeralContainersUpdateRequest(context.Background(), pod, pod.Spec.EphemeralContainers, 0)
 		assert.Nil(t, err)
 
 		require.NotNil(t, response)

@@ -278,15 +278,26 @@ func (webhook *webhook) validateOrMutate(ctx context.Context, request *admission
 
 	case admissionV1.Update:
 		// ephemeral containers can only be appended to a pod (never modified in place) via this
-		// dedicated subresource - `pod` here already reflects the post-append state, and there is
-		// no "old" resource to speak of, so it needs its own handling rather than going through
-		// `validateUpdateRequest`, which assumes no new resources ever show up on update.
+		// dedicated subresource - `pod` here already reflects the post-append state, so we need
+		// `request.OldObject` (the pre-append state) to figure out which containers are actually
+		// new, rather than going through `validateUpdateRequest`, which assumes no new resources
+		// ever show up on update.
 		if request.SubResource == "ephemeralcontainers" {
+			oldPod, err := unmarshallPod(request.OldObject)
+			if err != nil {
+				return nil, err
+			}
+
+			newEphemeralContainers, oldCount, err := newlyAppendedEphemeralContainers(pod, oldPod)
+			if err != nil {
+				return nil, err
+			}
+
 			switch operation {
 			case validate:
-				return webhook.validateEphemeralContainersUpdateRequest(ctx, pod, request.Namespace)
+				return webhook.validateEphemeralContainersUpdateRequest(ctx, pod, newEphemeralContainers, request.Namespace)
 			case mutate:
-				return webhook.mutateEphemeralContainersUpdateRequest(ctx, pod)
+				return webhook.mutateEphemeralContainersUpdateRequest(ctx, pod, newEphemeralContainers, oldCount)
 			default:
 				// shouldn't happen, but needed so that all paths in the function have a return value
 				panic(fmt.Errorf("unexpected webhook operation: %v", operation))
@@ -325,13 +336,38 @@ func (webhook *webhook) validateCreateRequest(ctx context.Context, pod *corev1.P
 	return webhook.validateWindowsSecurityOptions(ctx, pod, namespace, iterateOverWindowsSecurityOptions)
 }
 
-// validateEphemeralContainersUpdateRequest ensures that the GMSA contents set on any of the pod's
-// ephemeral containers match the corresponding GMSA names, and that the pod's service account is
-// authorized to `use` the requested GMSA's. Ephemeral containers can only be appended to a pod (never
-// modified or removed) via the `ephemeralcontainers` subresource, so the same checks used at pod
-// creation time apply here, run only over `.Spec.EphemeralContainers`.
-func (webhook *webhook) validateEphemeralContainersUpdateRequest(ctx context.Context, pod *corev1.Pod, namespace string) (*admissionV1.AdmissionResponse, *podAdmissionError) {
-	return webhook.validateWindowsSecurityOptions(ctx, pod, namespace, iterateOverEphemeralContainerWindowsSecurityOptions)
+// newlyAppendedEphemeralContainers checks that `pod.Spec.EphemeralContainers` is `oldPod`'s
+// `.Spec.EphemeralContainers` with zero or more new entries appended to it - the only way ephemeral
+// containers can legally change on a `pods/ephemeralcontainers` update request - and returns those
+// newly appended containers, along with the number of containers that were already present in
+// `oldPod` (used as the JSON-patch index offset by callers that need to patch the new containers).
+func newlyAppendedEphemeralContainers(pod, oldPod *corev1.Pod) ([]corev1.EphemeralContainer, int, *podAdmissionError) {
+	oldContainers := oldPod.Spec.EphemeralContainers
+	newContainers := pod.Spec.EphemeralContainers
+
+	if len(newContainers) < len(oldContainers) || !reflect.DeepEqual(newContainers[:len(oldContainers)], oldContainers) {
+		return nil, 0, &podAdmissionError{
+			error: errors.New("ephemeral containers can only be appended to a pod, existing ones cannot be modified or removed"),
+			pod:   pod,
+			code:  http.StatusBadRequest,
+		}
+	}
+
+	return newContainers[len(oldContainers):], len(oldContainers), nil
+}
+
+// validateEphemeralContainersUpdateRequest ensures that the GMSA contents set on `newContainers` -
+// the ephemeral containers newly appended by this request, as computed by
+// `newlyAppendedEphemeralContainers` - match the corresponding GMSA names, and that the pod's
+// service account is authorized to `use` the requested GMSA's. Only the newly appended containers
+// are inspected: previously admitted ephemeral containers must not be re-validated, since their
+// backing GMSA resource or the service account's authorization to use it may have changed since
+// they were admitted, which must not cause this, unrelated, request to be rejected.
+func (webhook *webhook) validateEphemeralContainersUpdateRequest(ctx context.Context, pod *corev1.Pod, newContainers []corev1.EphemeralContainer, namespace string) (*admissionV1.AdmissionResponse, *podAdmissionError) {
+	iterate := func(_ *corev1.Pod, f func(windowsOptions *corev1.WindowsSecurityContextOptions, resourceKind gmsaResourceKind, resourceName string, containerIndex int) *podAdmissionError) *podAdmissionError {
+		return iterateOverGivenEphemeralContainersWindowsSecurityOptions(newContainers, 0, f)
+	}
+	return webhook.validateWindowsSecurityOptions(ctx, pod, namespace, iterate)
 }
 
 // validateWindowsSecurityOptions ensures that the GMSA contents set in the resources reachable via
@@ -425,13 +461,18 @@ func (webhook *webhook) mutateCreateRequest(ctx context.Context, pod *corev1.Pod
 	return buildPatchResponse(pod, patches)
 }
 
-// mutateEphemeralContainersUpdateRequest inlines the requested GMSA's into any of the pod's ephemeral
-// containers' `WindowsSecurityOptions` structs. Ephemeral containers can only be appended to a pod
-// (never modified or removed) via the `ephemeralcontainers` subresource, so it is safe to run this
-// over the whole `.Spec.EphemeralContainers` list on every such request: any container that was
-// already mutated by a previous request already has its GMSA contents set, and is left untouched.
-func (webhook *webhook) mutateEphemeralContainersUpdateRequest(ctx context.Context, pod *corev1.Pod) (*admissionV1.AdmissionResponse, *podAdmissionError) {
-	patches, _, err := webhook.computeGMSAPatches(ctx, pod, iterateOverEphemeralContainerWindowsSecurityOptions)
+// mutateEphemeralContainersUpdateRequest inlines the requested GMSA's into `newContainers` - the
+// ephemeral containers newly appended by this request, as computed by
+// `newlyAppendedEphemeralContainers` - `WindowsSecurityOptions` structs. Only the newly appended
+// containers are inspected, since previously admitted ones are immutable; `indexOffset` (the number
+// of ephemeral containers that already existed before this request) is added to the JSON-patch
+// index so patches land on the right entries of `.Spec.EphemeralContainers`.
+func (webhook *webhook) mutateEphemeralContainersUpdateRequest(ctx context.Context, pod *corev1.Pod, newContainers []corev1.EphemeralContainer, indexOffset int) (*admissionV1.AdmissionResponse, *podAdmissionError) {
+	iterate := func(_ *corev1.Pod, f func(windowsOptions *corev1.WindowsSecurityContextOptions, resourceKind gmsaResourceKind, resourceName string, containerIndex int) *podAdmissionError) *podAdmissionError {
+		return iterateOverGivenEphemeralContainersWindowsSecurityOptions(newContainers, indexOffset, f)
+	}
+
+	patches, _, err := webhook.computeGMSAPatches(ctx, pod, iterate)
 	if err != nil {
 		return nil, err
 	}
@@ -601,14 +642,23 @@ func iterateOverWindowsSecurityOptions(pod *corev1.Pod, f func(windowsOptions *c
 
 // iterateOverEphemeralContainerWindowsSecurityOptions calls `f` on each of the pod's ephemeral
 // containers' `.SecurityContext.WindowsOptions` field (see `iterateOverWindowsSecurityOptions` for
-// details on `f`'s contract). It is also used standalone (rather than through
-// `iterateOverWindowsSecurityOptions`) to validate/mutate `ephemeralcontainers` subresource update
-// requests, since ephemeral containers are the only resource that can be appended to a pod after
-// its creation.
+// details on `f`'s contract).
 func iterateOverEphemeralContainerWindowsSecurityOptions(pod *corev1.Pod, f func(windowsOptions *corev1.WindowsSecurityContextOptions, resourceKind gmsaResourceKind, resourceName string, containerIndex int) *podAdmissionError) *podAdmissionError {
-	for i, container := range pod.Spec.EphemeralContainers {
+	return iterateOverGivenEphemeralContainersWindowsSecurityOptions(pod.Spec.EphemeralContainers, 0, f)
+}
+
+// iterateOverGivenEphemeralContainersWindowsSecurityOptions calls `f` on each of `containers`'
+// `.SecurityContext.WindowsOptions` field (see `iterateOverWindowsSecurityOptions` for details on
+// `f`'s contract), offsetting the `containerIndex` passed to `f` by `indexOffset`. This is used
+// standalone (rather than through `iterateOverEphemeralContainerWindowsSecurityOptions`) to
+// validate/mutate `ephemeralcontainers` subresource update requests, so that only the newly
+// appended ephemeral containers are inspected, with `indexOffset` set to the number of ephemeral
+// containers that already existed on the pod, so that resulting JSON patches target the right
+// indices in `.Spec.EphemeralContainers`.
+func iterateOverGivenEphemeralContainersWindowsSecurityOptions(containers []corev1.EphemeralContainer, indexOffset int, f func(windowsOptions *corev1.WindowsSecurityContextOptions, resourceKind gmsaResourceKind, resourceName string, containerIndex int) *podAdmissionError) *podAdmissionError {
+	for i, container := range containers {
 		if container.SecurityContext != nil && container.SecurityContext.WindowsOptions != nil {
-			if err := f(container.SecurityContext.WindowsOptions, ephemeralContainerKind, container.Name, i); err != nil {
+			if err := f(container.SecurityContext.WindowsOptions, ephemeralContainerKind, container.Name, indexOffset+i); err != nil {
 				return err
 			}
 		}
