@@ -815,6 +815,44 @@ func TestNewlyAppendedEphemeralContainers(t *testing.T) {
 		assertPodAdmissionErrorContains(t, err, pod, http.StatusBadRequest,
 			"ephemeral containers can only be appended to a pod, existing ones cannot be modified or removed")
 	})
+
+	t.Run("if an existing container is removed and a new one appended in the same request, it fails", func(t *testing.T) {
+		anotherExistingContainer := corev1.EphemeralContainer{
+			EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "another-existing-container"},
+		}
+
+		// oldPod has two existing containers; the request removes anotherExistingContainer and
+		// appends newContainer, keeping the same total count - this must still be rejected, since
+		// the old containers are no longer an unchanged prefix of the new list.
+		oldPod := buildPodWithContainers(existingContainer, anotherExistingContainer)
+		pod := buildPodWithContainers(existingContainer, newContainer)
+
+		newContainers, oldCount, err := newlyAppendedEphemeralContainers(pod, oldPod)
+		assert.Nil(t, newContainers)
+		assert.Equal(t, 0, oldCount)
+		assertPodAdmissionErrorContains(t, err, pod, http.StatusBadRequest,
+			"ephemeral containers can only be appended to a pod, existing ones cannot be modified or removed")
+	})
+
+	t.Run("if an existing container is removed and two new ones are appended, growing the list, it still fails", func(t *testing.T) {
+		anotherExistingContainer := corev1.EphemeralContainer{
+			EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "another-existing-container"},
+		}
+		anotherNewContainer := corev1.EphemeralContainer{
+			EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "another-new-container"},
+		}
+
+		// the new list is longer than the old one, so the cheap length check alone wouldn't catch
+		// this - it must be caught by the prefix-equality check instead.
+		oldPod := buildPodWithContainers(existingContainer, anotherExistingContainer)
+		pod := buildPodWithContainers(existingContainer, newContainer, anotherNewContainer)
+
+		newContainers, oldCount, err := newlyAppendedEphemeralContainers(pod, oldPod)
+		assert.Nil(t, newContainers)
+		assert.Equal(t, 0, oldCount)
+		assertPodAdmissionErrorContains(t, err, pod, http.StatusBadRequest,
+			"ephemeral containers can only be appended to a pod, existing ones cannot be modified or removed")
+	})
 }
 
 // TestValidateOrMutateEphemeralContainersSubresourceRequest is an AdmissionRequest-level test (as
@@ -938,6 +976,47 @@ func TestValidateOrMutateEphemeralContainersSubresourceRequest(t *testing.T) {
 		assertPodAdmissionErrorContains(t, err, expectedPod, http.StatusUnprocessableEntity,
 			"the GMSA cred spec contents for %s %q does not match the contents of GMSA resource %q",
 			ephemeralContainerKind, newContainerName, dummyCredSpecName)
+	})
+
+	t.Run("both validate and mutate reject a request that removes the existing container while appending a new one", func(t *testing.T) {
+		newContainer := corev1.EphemeralContainer{
+			EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+				Name:            newContainerName,
+				SecurityContext: &corev1.SecurityContext{WindowsOptions: buildWindowsOptions(dummyCredSpecName, currentCredSpecContents)},
+			},
+		}
+
+		// unlike buildRequest, this pod does not retain the existing container - it replaces it
+		// with the new one instead, keeping the same total count.
+		pod := buildPod(dummyServiceAccoutName, nil, nil)
+		pod.Spec.EphemeralContainers = []corev1.EphemeralContainer{newContainer}
+
+		oldPodRaw, err := json.Marshal(oldPod)
+		require.NoError(t, err)
+		podRaw, err := json.Marshal(pod)
+		require.NoError(t, err)
+
+		request := &admissionV1.AdmissionRequest{
+			Kind:        metav1.GroupVersionKind{Kind: "Pod"},
+			Namespace:   dummyNamespace,
+			Operation:   admissionV1.Update,
+			SubResource: "ephemeralcontainers",
+			Object:      runtime.RawExtension{Raw: podRaw},
+			OldObject:   runtime.RawExtension{Raw: oldPodRaw},
+		}
+
+		expectedPod := &corev1.Pod{}
+		require.NoError(t, json.Unmarshal(podRaw, expectedPod))
+
+		for _, operation := range []webhookOperation{validate, mutate} {
+			webhook := newWebhook(kubeClientFactory())
+
+			response, err := webhook.validateOrMutate(context.Background(), request, operation)
+			assert.Nil(t, response)
+
+			assertPodAdmissionErrorContains(t, err, expectedPod, http.StatusBadRequest,
+				"ephemeral containers can only be appended to a pod, existing ones cannot be modified or removed")
+		}
 	})
 }
 
