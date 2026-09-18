@@ -611,6 +611,33 @@ func TestValidateEphemeralContainersUpdateRequest(t *testing.T) {
 			"service account %q is not authorized to `use` GMSA cred spec %q, reason: %q",
 			dummyServiceAccoutName, dummyCredSpecName, dummyReason)
 	})
+
+	t.Run("with a newly added ephemeral container that doesn't set a GMSA name, it passes without checking authorization or cred spec contents", func(t *testing.T) {
+		client := kubeClientFactory()
+		client.isAuthorizedToUseCredSpecFunc = func(ctx context.Context, serviceAccountName, namespace, credSpecName string) (authorized bool, reason string) {
+			t.Fatal("isAuthorizedToUseCredSpec should not be called for a container with no GMSA name set")
+			return false, ""
+		}
+		client.retrieveCredSpecContentsFunc = func(ctx context.Context, credSpecName string) (contents string, httpCode int, err error) {
+			t.Fatal("retrieveCredSpecContents should not be called for a container with no GMSA name set")
+			return "", 0, nil
+		}
+
+		webhook := newWebhook(client)
+
+		runAsUserName := "some-user"
+		ephemeralOptions := &corev1.WindowsSecurityContextOptions{RunAsUserName: &runAsUserName}
+		pod := buildPodWithEphemeralContainers(
+			dummyServiceAccoutName, nil, nil, nil, nil,
+			map[string]*corev1.WindowsSecurityContextOptions{dummyContainerName: ephemeralOptions},
+		)
+
+		response, err := webhook.validateEphemeralContainersUpdateRequest(context.Background(), pod, pod.Spec.EphemeralContainers, dummyNamespace)
+		assert.Nil(t, err)
+
+		require.NotNil(t, response)
+		assert.True(t, response.Allowed)
+	})
 }
 
 // TestMutateEphemeralContainersUpdateRequest checks that `mutateEphemeralContainersUpdateRequest` only
@@ -665,6 +692,66 @@ func TestMutateEphemeralContainersUpdateRequest(t *testing.T) {
 		require.NotNil(t, response)
 		assert.True(t, response.Allowed)
 		assert.Nil(t, response.Patch)
+	})
+
+	t.Run("with a new ephemeral container whose windows options don't set a GMSA name, it does not patch it", func(t *testing.T) {
+		webhook := newWebhookWithOptions(kubeClientFactory(), WithRandomHostname(true))
+
+		runAsUserName := "some-user"
+		ephemeralOptions := &corev1.WindowsSecurityContextOptions{RunAsUserName: &runAsUserName}
+
+		pod := buildPodWithEphemeralContainers(
+			dummyServiceAccoutName, nil, nil, nil, nil,
+			map[string]*corev1.WindowsSecurityContextOptions{dummyContainerName: ephemeralOptions},
+		)
+
+		response, err := webhook.mutateEphemeralContainersUpdateRequest(context.Background(), pod, pod.Spec.EphemeralContainers, 0)
+		assert.Nil(t, err)
+
+		require.NotNil(t, response)
+		assert.True(t, response.Allowed)
+		assert.Nil(t, response.Patch)
+	})
+
+	t.Run("with several newly appended ephemeral containers, it only patches the one with a GMSA name, at its own index", func(t *testing.T) {
+		webhook := newWebhookWithOptions(kubeClientFactory(), WithRandomHostname(true))
+
+		runAsUserName := "some-user"
+		newContainers := []corev1.EphemeralContainer{
+			{
+				EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+					Name:            "no-gmsa-container-1",
+					SecurityContext: &corev1.SecurityContext{WindowsOptions: &corev1.WindowsSecurityContextOptions{RunAsUserName: &runAsUserName}},
+				},
+			},
+			{
+				EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+					Name:            "gmsa-container",
+					SecurityContext: &corev1.SecurityContext{WindowsOptions: buildWindowsOptions(dummyCredSpecName, "")},
+				},
+			},
+			{
+				EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+					Name: "no-gmsa-container-2",
+					// no security context at all
+				},
+			},
+		}
+
+		pod := buildPod(dummyServiceAccoutName, nil, nil)
+		pod.Spec.EphemeralContainers = newContainers
+
+		response, err := webhook.mutateEphemeralContainersUpdateRequest(context.Background(), pod, newContainers, 0)
+		assert.Nil(t, err)
+
+		require.NotNil(t, response)
+		assert.True(t, response.Allowed)
+
+		var patches []map[string]string
+		if err := json.Unmarshal(response.Patch, &patches); assert.Nil(t, err) && assert.Equal(t, 1, len(patches)) {
+			assert.Equal(t, "/spec/ephemeralContainers/1/securityContext/windowsOptions/gmsaCredentialSpec", patches[0]["path"])
+			assert.Equal(t, dummyCredSpecContents, patches[0]["value"])
+		}
 	})
 }
 
