@@ -11,6 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 	admissionV1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 func TestValidateCreateRequest(t *testing.T) {
@@ -663,6 +665,192 @@ func TestMutateEphemeralContainersUpdateRequest(t *testing.T) {
 		require.NotNil(t, response)
 		assert.True(t, response.Allowed)
 		assert.Nil(t, response.Patch)
+	})
+}
+
+// TestNewlyAppendedEphemeralContainers checks that `newlyAppendedEphemeralContainers` correctly
+// identifies the containers newly appended by a `pods/ephemeralcontainers` update request, and
+// rejects requests where the old containers were not left as an unchanged prefix of the new list.
+func TestNewlyAppendedEphemeralContainers(t *testing.T) {
+	existingContainer := corev1.EphemeralContainer{
+		EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "existing-container"},
+	}
+	newContainer := corev1.EphemeralContainer{
+		EphemeralContainerCommon: corev1.EphemeralContainerCommon{Name: "new-container"},
+	}
+
+	buildPodWithContainers := func(containers ...corev1.EphemeralContainer) *corev1.Pod {
+		pod := buildPod(dummyServiceAccoutName, nil, nil)
+		pod.Spec.EphemeralContainers = containers
+		return pod
+	}
+
+	t.Run("with no new containers, it returns an empty slice and no error", func(t *testing.T) {
+		oldPod := buildPodWithContainers(existingContainer)
+		pod := buildPodWithContainers(existingContainer)
+
+		newContainers, oldCount, err := newlyAppendedEphemeralContainers(pod, oldPod)
+		assert.Nil(t, err)
+		assert.Equal(t, 1, oldCount)
+		assert.Empty(t, newContainers)
+	})
+
+	t.Run("with a newly appended container, it returns just that container", func(t *testing.T) {
+		oldPod := buildPodWithContainers(existingContainer)
+		pod := buildPodWithContainers(existingContainer, newContainer)
+
+		newContainers, oldCount, err := newlyAppendedEphemeralContainers(pod, oldPod)
+		assert.Nil(t, err)
+		assert.Equal(t, 1, oldCount)
+		assert.Equal(t, []corev1.EphemeralContainer{newContainer}, newContainers)
+	})
+
+	t.Run("if the new list is shorter than the old one, it fails", func(t *testing.T) {
+		oldPod := buildPodWithContainers(existingContainer, newContainer)
+		pod := buildPodWithContainers(existingContainer)
+
+		newContainers, oldCount, err := newlyAppendedEphemeralContainers(pod, oldPod)
+		assert.Nil(t, newContainers)
+		assert.Equal(t, 0, oldCount)
+		assertPodAdmissionErrorContains(t, err, pod, http.StatusBadRequest,
+			"ephemeral containers can only be appended to a pod, existing ones cannot be modified or removed")
+	})
+
+	t.Run("if an existing container was modified, it fails", func(t *testing.T) {
+		oldPod := buildPodWithContainers(existingContainer)
+		modifiedContainer := existingContainer
+		modifiedContainer.Image = "some-other-image"
+		pod := buildPodWithContainers(modifiedContainer, newContainer)
+
+		newContainers, oldCount, err := newlyAppendedEphemeralContainers(pod, oldPod)
+		assert.Nil(t, newContainers)
+		assert.Equal(t, 0, oldCount)
+		assertPodAdmissionErrorContains(t, err, pod, http.StatusBadRequest,
+			"ephemeral containers can only be appended to a pod, existing ones cannot be modified or removed")
+	})
+}
+
+// TestValidateOrMutateEphemeralContainersSubresourceRequest is an AdmissionRequest-level test (as
+// opposed to the more unit-level TestValidateEphemeralContainersUpdateRequest and
+// TestMutateEphemeralContainersUpdateRequest above) covering a pod with one already-admitted
+// ephemeral container and one newly appended one, to make sure `validateOrMutate` only inspects the
+// newly appended container: the already-admitted one's GMSA settings must not be re-validated (its
+// backing GMSA resource may have changed since it was admitted), and any patch generated for the new
+// container must target the right index in `.Spec.EphemeralContainers`.
+func TestValidateOrMutateEphemeralContainersSubresourceRequest(t *testing.T) {
+	const (
+		existingContainerName   = "existing-container"
+		newContainerName        = "new-container"
+		currentCredSpecContents = "current-cred-spec-contents"
+		staleCredSpecContents   = "stale-cred-spec-contents"
+	)
+
+	// the existing container was admitted with `staleCredSpecContents`, which no longer matches
+	// what the GMSA resource currently holds (`currentCredSpecContents`) - simulating drift since
+	// admission. The newly appended container was already mutated with the current contents.
+	oldPod := buildPod(dummyServiceAccoutName, nil, nil)
+	oldPod.Spec.EphemeralContainers = []corev1.EphemeralContainer{
+		{
+			EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+				Name:            existingContainerName,
+				SecurityContext: &corev1.SecurityContext{WindowsOptions: buildWindowsOptions(dummyCredSpecName, staleCredSpecContents)},
+			},
+		},
+	}
+
+	buildRequest := func(t *testing.T, newContainer corev1.EphemeralContainer) (*admissionV1.AdmissionRequest, *corev1.Pod) {
+		pod := oldPod.DeepCopy()
+		pod.Spec.EphemeralContainers = append(pod.Spec.EphemeralContainers, newContainer)
+
+		oldPodRaw, err := json.Marshal(oldPod)
+		require.NoError(t, err)
+		podRaw, err := json.Marshal(pod)
+		require.NoError(t, err)
+
+		request := &admissionV1.AdmissionRequest{
+			Kind:        metav1.GroupVersionKind{Kind: "Pod"},
+			Namespace:   dummyNamespace,
+			Operation:   admissionV1.Update,
+			SubResource: "ephemeralcontainers",
+			Object:      runtime.RawExtension{Raw: podRaw},
+			OldObject:   runtime.RawExtension{Raw: oldPodRaw},
+		}
+
+		// validateOrMutate re-unmarshals `request.Object` into its own `*corev1.Pod`, so callers
+		// checking `podAdmissionError.pod` need this equivalent (but distinct) copy to compare against.
+		expectedPod := &corev1.Pod{}
+		require.NoError(t, json.Unmarshal(podRaw, expectedPod))
+
+		return request, expectedPod
+	}
+
+	kubeClientFactory := func() *dummyKubeClient {
+		return &dummyKubeClient{
+			retrieveCredSpecContentsFunc: func(ctx context.Context, credSpecName string) (contents string, httpCode int, err error) {
+				return currentCredSpecContents, http.StatusOK, nil
+			},
+		}
+	}
+
+	t.Run("validate ignores the already-admitted container's now-stale GMSA settings", func(t *testing.T) {
+		webhook := newWebhook(kubeClientFactory())
+
+		newContainer := corev1.EphemeralContainer{
+			EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+				Name:            newContainerName,
+				SecurityContext: &corev1.SecurityContext{WindowsOptions: buildWindowsOptions(dummyCredSpecName, currentCredSpecContents)},
+			},
+		}
+
+		request, _ := buildRequest(t, newContainer)
+		response, err := webhook.validateOrMutate(context.Background(), request, validate)
+		assert.Nil(t, err)
+
+		require.NotNil(t, response)
+		assert.True(t, response.Allowed)
+	})
+
+	t.Run("mutate only patches the newly appended container, at the correct index", func(t *testing.T) {
+		webhook := newWebhook(kubeClientFactory())
+
+		newContainer := corev1.EphemeralContainer{
+			EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+				Name:            newContainerName,
+				SecurityContext: &corev1.SecurityContext{WindowsOptions: buildWindowsOptions(dummyCredSpecName, "")},
+			},
+		}
+
+		request, _ := buildRequest(t, newContainer)
+		response, err := webhook.validateOrMutate(context.Background(), request, mutate)
+		assert.Nil(t, err)
+
+		require.NotNil(t, response)
+		assert.True(t, response.Allowed)
+
+		var patches []map[string]string
+		if err := json.Unmarshal(response.Patch, &patches); assert.Nil(t, err) && assert.Equal(t, 1, len(patches)) {
+			assert.Equal(t, "/spec/ephemeralContainers/1/securityContext/windowsOptions/gmsaCredentialSpec", patches[0]["path"])
+			assert.Equal(t, currentCredSpecContents, patches[0]["value"])
+		}
+	})
+
+	t.Run("validate still rejects a newly appended container with mismatching GMSA settings", func(t *testing.T) {
+		webhook := newWebhook(kubeClientFactory())
+
+		newContainer := corev1.EphemeralContainer{
+			EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+				Name:            newContainerName,
+				SecurityContext: &corev1.SecurityContext{WindowsOptions: buildWindowsOptions(dummyCredSpecName, staleCredSpecContents)},
+			},
+		}
+
+		request, expectedPod := buildRequest(t, newContainer)
+		response, err := webhook.validateOrMutate(context.Background(), request, validate)
+		assert.Nil(t, response)
+
+		assertPodAdmissionErrorContains(t, err, expectedPod, http.StatusUnprocessableEntity,
+			"the GMSA cred spec contents for %s %q does not match the contents of GMSA resource %q",
+			ephemeralContainerKind, newContainerName, dummyCredSpecName)
 	})
 }
 
